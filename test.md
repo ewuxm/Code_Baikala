@@ -6,3 +6,5 @@
 Последующие запросы от лица преподавателя:
 <img width="1260" height="1010" alt="image" src="https://github.com/user-attachments/assets/002635c4-ad51-42cd-9606-6d8884cc8efb" />
 <img width="1171" height="729" alt="image" src="https://github.com/user-attachments/assets/25bad2fb-f7a7-4735-8598-4a60e041b43f" />
+<img width="1268" height="863" alt="image" src="https://github.com/user-attachments/assets/cb1cfb36-cd0d-4b6a-b42d-3235aa702ae3" />
+дисциплины ИВТ  у нас в бд действительно не существует 
