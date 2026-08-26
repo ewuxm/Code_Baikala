@@ -4,29 +4,34 @@ import requests
 import json
 import logging
 import os
+from dotenv import load_dotenv
 import re
 import sys
 import time
 import html
+import hashlib
+import hmac
 from getpass import getpass
 from typing import Optional
+
+load_dotenv()
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "b1gp3mc7fu31gs7lgm0u").strip()
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "").strip()
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
 
 # Актуальный REST endpoint Yandex AI Studio Text Generation API.
 YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YANDEX_MODEL = f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest"
 
-DB_HOST = os.getenv("DB_HOST", "185.241.193.203")
+DB_HOST = os.getenv("DB_HOST", "").strip()
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "vesna-db4")
-DB_USER = os.getenv("DB_USER", "vdb4_user")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "").strip()
+DB_USER = os.getenv("DB_USER", "").strip()
+DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -36,6 +41,116 @@ MAX_ROWS = 100
 MAX_LLM_ROWS = 50
 MAX_QUESTION_LENGTH = 1000
 MAX_SQL_REPAIR_ATTEMPTS = 2
+
+# ============================================================
+# USER ROLES / ACCESS POLICY
+# ============================================================
+
+ROLE_COOKIE = "university_role"
+ROLE_SECRET = os.getenv("ROLE_SECRET", "").encode("utf-8")
+if not ROLE_SECRET:
+    raise RuntimeError("ROLE_SECRET не задан в .env")
+
+ROLE_LABELS = {
+    "applicant": "Абитуриент",
+    "student": "Студент",
+    "teacher": "Преподаватель",
+}
+
+# Внимание: поскольку пользователь выбирает роль без пароля,
+# это режим доступа, а не подтверждение личности. Для production
+# роль нужно связывать с реальным аккаунтом/SSO/LDAP.
+ROLE_ALLOWED_RELATIONS = {
+    "applicant": {
+        "faculties", "departments", "study_programs",
+        "admission_statistics",
+        "v_faculty_search", "v_faculty_statistics",
+        "v_simple_faculty_stats",
+    },
+    "student": {
+        "faculties", "departments", "study_programs",
+        "courses", "groups", "schedule", "academic_statistics",
+        "v_students_by_faculty", "v_simple_faculty_stats",
+        "v_faculty_search", "v_faculty_statistics",
+        "v_students_anonymized", "v_teachers_anonymized",
+    },
+    "teacher": set(),
+}
+
+def sign_role(role: str) -> str:
+    signature = hmac.new(
+        ROLE_SECRET, role.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{role}.{signature}"
+
+def verify_role(value: str) -> Optional[str]:
+    try:
+        role, signature = value.rsplit(".", 1)
+    except ValueError:
+        return None
+    if role not in ROLE_LABELS:
+        return None
+    expected = hmac.new(
+        ROLE_SECRET, role.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return role if hmac.compare_digest(signature, expected) else None
+
+def get_role_from_headers(headers: dict) -> Optional[str]:
+    cookie = headers.get("cookie", "")
+    for item in cookie.split(";"):
+        item = item.strip()
+        if item.startswith(ROLE_COOKIE + "="):
+            return verify_role(item.split("=", 1)[1])
+    return None
+
+def role_relations(role: str) -> set[str]:
+    return ROLE_ALLOWED_RELATIONS.get(role, set())
+
+def role_description(role: str) -> str:
+    return {
+        "applicant": (
+            "Роль: АБИТУРИЕНТ. Доступны только факультеты, направления, "
+            "поступление и открытая статистика. Нельзя получать сведения "
+            "о студентах, оценках, средних баллах, расписании и преподавателях."
+        ),
+        "student": (
+            "Роль: СТУДЕНТ. Доступна учебная информация и агрегированная "
+            "статистика. Нельзя выдавать персональные данные других студентов."
+        ),
+        "teacher": (
+            "Роль: ПРЕПОДАВАТЕЛЬ. Доступны все relations, разрешенные "
+            "приложением, включая сведения о студентах, оценках и академической "
+            "статистике. Изменение БД по-прежнему запрещено."
+        ),
+    }[role]
+
+def validate_role_question(role: str, question: str) -> tuple[bool, str]:
+    q = question.lower()
+
+    if role == "applicant":
+        blocked = (
+            "средн", "оцен", "балл", "grade", "grades",
+            "студент", "преподавател", "расписан", "академическ",
+            "успеваем",
+        )
+        if any(x in q for x in blocked):
+            return False, (
+                "В роли «Абитуриент» этот тип информации недоступен. "
+                "Можно спрашивать о факультетах, направлениях и поступлении."
+            )
+
+    if role == "student":
+        blocked = (
+            "фио", "фамили", "имя", "отчество", "student_code",
+            "идентификатор студента", "телефон", "email", "почт",
+            "паспорт", "адрес",
+        )
+        if any(x in q for x in blocked):
+            return False, (
+                "В роли «Студент» персональные данные других студентов недоступны."
+            )
+
+    return True, "OK"
 
 # Разрешенные таблицы/views из вашей схемы.
 ALLOWED_RELATIONS = {
@@ -59,6 +174,8 @@ ALLOWED_RELATIONS = {
     "v_students_anonymized",
     "v_teachers_anonymized",
 }
+
+ROLE_ALLOWED_RELATIONS["teacher"] = set(ALLOWED_RELATIONS)
 
 # Нельзя выдавать идентификаторы/персональные данные студентов.
 FORBIDDEN_STUDENT_COLUMNS = {
@@ -98,6 +215,179 @@ logger = logging.getLogger("university_ai")
 
 pool: Optional[asyncpg.Pool] = None
 SCHEMA_CACHE: Optional[str] = None
+
+
+# ============================================================
+# CANONICAL UNIVERSITY TERMS
+# ============================================================
+
+# ВАЖНО: это не просто подсказка для LLM.
+# Этот словарь используется ДО выполнения SQL и принудительно
+# приводит разговорные/склоненные названия факультетов к тем
+# значениям, которые реально лежат в faculties.name.
+FACULTY_CANONICAL = {
+    "технологический факультет": "Технологический факультет",
+    "технологического факультета": "Технологический факультет",
+    "технологическом факультете": "Технологический факультет",
+    "технологический": "Технологический факультет",
+    "технологического": "Технологический факультет",
+    "технологическом": "Технологический факультет",
+    "техфак": "Технологический факультет",
+    "ит": "Технологический факультет",
+    "информатика": "Технологический факультет",
+
+    "экономический факультет": "Экономический факультет",
+    "экономического факультета": "Экономический факультет",
+    "экономическом факультете": "Экономический факультет",
+    "экономический": "Экономический факультет",
+    "экономического": "Экономический факультет",
+    "экономическом": "Экономический факультет",
+    "экономика": "Экономический факультет",
+    "эконом": "Экономический факультет",
+
+    "математический факультет": "Математический факультет",
+    "математического факультета": "Математический факультет",
+    "математическом факультете": "Математический факультет",
+    "математический": "Математический факультет",
+    "математического": "Математический факультет",
+    "математическом": "Математический факультет",
+    "матфак": "Математический факультет",
+
+    "юридический факультет": "Юридический факультет",
+    "юридического факультета": "Юридический факультет",
+    "юридическом факультете": "Юридический факультет",
+    "юридический": "Юридический факультет",
+    "юридического": "Юридический факультет",
+    "юридическом": "Юридический факультет",
+    "юриспруденция": "Юридический факультет",
+    "юрист": "Юридический факультет",
+    "право": "Юридический факультет",
+    "юрфак": "Юридический факультет",
+
+    "лингвистический факультет": "Лингвистический факультет",
+    "лингвистического факультета": "Лингвистический факультет",
+    "лингвистическом факультете": "Лингвистический факультет",
+    "лингвистическому факультету": "Лингвистический факультет",
+    "лингвистический": "Лингвистический факультет",
+    "лингвистического": "Лингвистический факультет",
+    "лингвистическом": "Лингвистический факультет",
+    "лингвистика": "Лингвистический факультет",
+    "лингвистики": "Лингвистический факультет",
+    "лингвистике": "Лингвистический факультет",
+    "факультет лингвистики": "Лингвистический факультет",
+    "факультета лингвистики": "Лингвистический факультет",
+    "филология": "Лингвистический факультет",
+    "филологический": "Лингвистический факультет",
+    "иностранные языки": "Лингвистический факультет",
+}
+
+
+def normalize_question_entities(question: str) -> str:
+    """
+    Нормализует сущности в вопросе пользователя ДО LLM.
+
+    Это улучшает генерацию SQL, но не является единственной защитой:
+    canonicalize_sql_literals() ниже дополнительно исправляет уже
+    сгенерированный SQL.
+    """
+    result = question
+
+    # Сначала длинные фразы, чтобы не ломать их частичной заменой.
+    aliases = sorted(
+        FACULTY_CANONICAL.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+    for alias, canonical in aliases:
+        result = re.sub(
+            rf"(?<![А-Яа-яЁёA-Za-z]){re.escape(alias)}(?![А-Яа-яЁёA-Za-z])",
+            canonical,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+    return result
+
+
+def canonicalize_sql_literals(sql: str) -> str:
+    """
+    КРИТИЧЕСКИЙ слой.
+
+    Если LLM уже успела сгенерировать:
+        faculty_name = 'Лингвистика'
+
+    превращаем это в:
+        faculty_name = 'Лингвистический факультет'
+
+    Здесь мы намеренно не заменяем все строки подряд: слово
+    "Лингвистика" является легальным названием направления
+    study_programs.name, поэтому глобальная замена была бы ошибкой.
+    """
+
+    aliases = sorted(
+        FACULTY_CANONICAL.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+    # 1. Фильтрация по faculty_name в views.
+    def replace_faculty_name(match):
+        prefix = match.group(1)
+        value = match.group(2)
+        canonical = FACULTY_CANONICAL.get(value.strip().lower())
+        if canonical:
+            return f"{prefix}'{canonical}'"
+        return match.group(0)
+
+    sql = re.sub(
+        r"(\bfaculty_name\s*=\s*)'([^']+)'",
+        replace_faculty_name,
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # 2. Фильтрация faculties.name.
+    # Не трогаем study_programs.name, потому что там "Лингвистика"
+    # является настоящим значением.
+    def replace_faculties_name(match):
+        prefix = match.group(1)
+        value = match.group(2)
+        canonical = FACULTY_CANONICAL.get(value.strip().lower())
+        if canonical:
+            return f"{prefix}'{canonical}'"
+        return match.group(0)
+
+    sql = re.sub(
+        r"(\bfaculties\s*\.\s*name\s*=\s*)'([^']+)'",
+        replace_faculties_name,
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # 3. Прямой FROM faculties + WHERE name = ...
+    # Безопасно обрабатываем только простой SELECT из faculties.
+    if re.search(
+        r"\bFROM\s+faculties\b",
+        sql,
+        flags=re.IGNORECASE,
+    ):
+        def replace_plain_name(match):
+            prefix = match.group(1)
+            value = match.group(2)
+            canonical = FACULTY_CANONICAL.get(value.strip().lower())
+            if canonical:
+                return f"{prefix}'{canonical}'"
+            return match.group(0)
+
+        sql = re.sub(
+            r"(\bname\s*=\s*)'([^']+)'",
+            replace_plain_name,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    return sql
 
 
 # ============================================================
@@ -365,7 +655,7 @@ def clean_sql(text: str) -> str:
     return text
 
 
-def validate_sql(sql: str) -> tuple[bool, str]:
+def validate_sql(sql: str, role: str = "teacher") -> tuple[bool, str]:
     sql = sql.strip()
 
     if not sql:
@@ -397,11 +687,15 @@ def validate_sql(sql: str) -> tuple[bool, str]:
         flags=re.IGNORECASE,
     )
 
+    if role not in ROLE_LABELS:
+        return False, "Неизвестная роль пользователя."
+
+    allowed_relations = role_relations(role)
     for relation in relations:
-        if relation.lower() not in ALLOWED_RELATIONS:
+        if relation.lower() not in allowed_relations:
             return False, (
-                f"Таблица/view '{relation}' "
-                f"не разрешена."
+                f"В роли «{ROLE_LABELS[role]}» таблица/view "
+                f"'{relation}' недоступна."
             )
 
     # CTE: имена CTE не должны маскировать реальные запрещенные
@@ -409,7 +703,7 @@ def validate_sql(sql: str) -> tuple[bool, str]:
     # проходят whitelist выше.
 
     # Нельзя делать SELECT * из students.
-    if re.search(r"\bstudents\b", sql, flags=re.IGNORECASE):
+    if role != "teacher" and re.search(r"\bstudents\b", sql, flags=re.IGNORECASE):
         if re.search(
             r"SELECT\s+\*\s+FROM\s+students\b",
             sql,
@@ -455,8 +749,8 @@ SQL_SYSTEM_PROMPT = """
 3. Никаких INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE.
 4. Никаких нескольких SQL-операторов.
 5. Не придумывай таблицы или колонки.
-6. Не выводи персональные данные студентов.
-7. Не выводи student_code.
+6. Для ролей applicant/student не выводи персональные данные студентов; для teacher это разрешено.
+7. Для ролей applicant/student не выводи student_code; для teacher это разрешено.
 8. Для вопросов о количестве студентов используй COUNT(*) либо
    готовые агрегаты соответствующих views.
 9. "обучается", "учится", "сейчас обучается" = status = 'active'.
@@ -508,21 +802,42 @@ WHERE status = 'active'
 """
 
 
-async def generate_sql(question: str) -> Optional[str]:
-    schema = await get_db_schema()
+async def generate_sql(question: str, role: str) -> Optional[str]:
+    full_schema = await get_db_schema()
+    allowed = role_relations(role)
+    schema_lines = []
+    for line in full_schema.splitlines():
+        if line.startswith("- "):
+            rel = line[2:].split(":", 1)[0].strip()
+            if rel not in allowed:
+                continue
+        schema_lines.append(line)
+    schema = "\n".join(schema_lines)
+
+    normalized_question = normalize_question_entities(question)
 
     prompt = (
         SQL_SYSTEM_PROMPT
         + "\n\n"
+        + role_description(role)
+        + "\nРазрешенные relations: "
+        + ", ".join(sorted(allowed))
+        + "\n\n"
         + schema
-        + "\n\nВОПРОС ПОЛЬЗОВАТЕЛЯ:\n"
-        + question
+        + "\n\nВАЖНО: перед генерацией SQL используй канонические названия "
+        + "факультетов из вопроса. Например: «лингвистика», «лингвистики», "
+        + "«факультет лингвистики» -> «Лингвистический факультет»; "
+        + "«экономика», «экономический» -> «Экономический факультет». "
+        + "Если фильтруешь v_students_by_faculty, используй точное значение "
+        + "faculty_name из БД, а не разговорный синоним.\n\n"
+        + "ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n"
+        + normalized_question
         + "\n\nТОЛЬКО SQL:"
     )
 
     answer = await call_yandex(
         [
-            {"role": "system", "text": SQL_SYSTEM_PROMPT},
+            {"role": "system", "text": SQL_SYSTEM_PROMPT + "\n\n" + role_description(role)},
             {"role": "user", "text": prompt},
         ],
         temperature=0.0,
@@ -534,7 +849,11 @@ async def generate_sql(question: str) -> Optional[str]:
 
     sql = clean_sql(answer)
 
-    valid, reason = validate_sql(sql)
+    # LLM может проигнорировать подсказку. Исправляем значения сущностей
+    # детерминированно до validate_sql() и до выполнения.
+    sql = canonicalize_sql_literals(sql)
+
+    valid, reason = validate_sql(sql, role)
 
     if not valid:
         logger.warning(
@@ -551,6 +870,7 @@ async def repair_sql(
     question: str,
     bad_sql: str,
     db_error: str,
+    role: str,
 ) -> Optional[str]:
     """
     Если SQL логически не подошел к реальной схеме,
@@ -561,6 +881,9 @@ async def repair_sql(
 
     prompt = f"""
 Исправь SQL-запрос PostgreSQL.
+
+{role_description(role)}
+Разрешенные relations: {', '.join(sorted(role_relations(role)))}
 
 ВОПРОС:
 {question}
@@ -577,7 +900,7 @@ async def repair_sql(
 Правила:
 - только один SELECT;
 - только разрешенные таблицы/views;
-- не использовать персональные идентификаторы студентов;
+- для applicant/student не использовать персональные идентификаторы студентов; для teacher это разрешено;
 - не придумывать колонки;
 - для "обучается" использовать status = 'active';
 - вернуть только исправленный SQL;
@@ -593,8 +916,9 @@ async def repair_sql(
         return None
 
     sql = clean_sql(answer)
+    sql = canonicalize_sql_literals(sql)
 
-    valid, reason = validate_sql(sql)
+    valid, reason = validate_sql(sql, role)
 
     if not valid:
         logger.warning(
@@ -611,8 +935,10 @@ async def repair_sql(
 # SQL EXECUTION
 # ============================================================
 
-async def execute_sql(sql: str):
-    valid, reason = validate_sql(sql)
+async def execute_sql(sql: str, role: str):
+    sql = canonicalize_sql_literals(clean_sql(sql))
+
+    valid, reason = validate_sql(sql, role)
 
     if not valid:
         return None, reason
@@ -756,12 +1082,13 @@ async def generate_human_answer(
     question: str,
     sql: str,
     rows,
+    role: str,
 ) -> str:
 
     data = serialize_rows(rows)
 
     if not data:
-        return "По вашему запросу данных не найдено."
+        return "Извините, по вашему запросу не удалось найти данные. Пожалуйста, задайте другой вопрос."
 
     exact = deterministic_answer(question, data)
     if exact:
@@ -775,6 +1102,8 @@ async def generate_human_answer(
 
     prompt = f"""
 Ты — русскоязычный ассистент университета.
+
+{role_description(role)}
 
 Ответь человеку на вопрос, используя ТОЛЬКО результат БД.
 
@@ -828,6 +1157,7 @@ async def log_query(
     question: str,
     sql: Optional[str],
     status: str,
+    role: str = "user",
     rows_returned: int = 0,
     error_message: Optional[str] = None,
     response_time_ms: Optional[int] = None,
@@ -859,7 +1189,7 @@ async def log_query(
                 )
                 """,
                 "local_user",
-                "user",
+                role,
                 question,
                 sql,
                 sql,
@@ -879,8 +1209,15 @@ async def log_query(
 # MAIN PIPELINE
 # ============================================================
 
-async def process_question(question: str) -> dict:
+async def process_question(question: str, role: str) -> dict:
     question = question.strip()
+
+    if role not in ROLE_LABELS:
+        return {"ok": False, "error": "Сначала выберите роль пользователя."}
+
+    allowed, role_error = validate_role_question(role, question)
+    if not allowed:
+        return {"ok": False, "error": role_error}
 
     if not question:
         return {
@@ -902,13 +1239,14 @@ async def process_question(question: str) -> dict:
     try:
         logger.info("Новый вопрос: %s", question)
 
-        sql = await generate_sql(question)
+        sql = await generate_sql(question, role)
 
         if not sql:
             await log_query(
                 question,
                 None,
                 "sql_generation_error",
+                role=role,
             )
             return {
                 "ok": False,
@@ -922,7 +1260,7 @@ async def process_question(question: str) -> dict:
         rows = None
 
         for attempt in range(MAX_SQL_REPAIR_ATTEMPTS + 1):
-            rows, last_error = await execute_sql(sql)
+            rows, last_error = await execute_sql(sql, role)
 
             if last_error is None:
                 break
@@ -940,6 +1278,7 @@ async def process_question(question: str) -> dict:
                 question,
                 sql,
                 last_error,
+                role,
             )
 
             if not repaired:
@@ -956,6 +1295,7 @@ async def process_question(question: str) -> dict:
                 question,
                 sql,
                 "execution_error",
+                role=role,
                 error_message=last_error,
                 response_time_ms=elapsed,
             )
@@ -973,6 +1313,7 @@ async def process_question(question: str) -> dict:
             question,
             sql,
             rows,
+            role,
         )
 
         elapsed = int(
@@ -985,6 +1326,7 @@ async def process_question(question: str) -> dict:
             question,
             sql,
             "success",
+            role=role,
             rows_returned=len(rows),
             response_time_ms=elapsed,
         )
@@ -1009,6 +1351,7 @@ async def process_question(question: str) -> dict:
             question,
             None,
             "internal_error",
+            role=role,
             error_message=str(exc),
             response_time_ms=elapsed,
         )
@@ -1022,291 +1365,116 @@ async def process_question(question: str) -> dict:
         }
 
 
+NO_DATA_MESSAGE = "Извините, по вашему запросу не удалось найти данные. Пожалуйста, задайте другой вопрос."
+
 # ============================================================
 # WEB UI
 # ============================================================
 
-HTML_PAGE = r"""<!doctype html>
+HTML_PAGE = r"""
+
+
+<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>University AI Assistant</title>
+<title>Код Байкала AI</title>
 <style>
-* { box-sizing: border-box; }
-body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-    background: #f4f6f8;
-    color: #202124;
-}
-.header {
-    background: #ffffff;
-    border-bottom: 1px solid #ddd;
-    padding: 18px 24px;
-    position: sticky;
-    top: 0;
-    z-index: 2;
-}
-.header h1 { margin: 0 0 5px; font-size: 22px; }
-.header p { margin: 0; color: #666; }
-.container {
-    max-width: 1000px;
-    margin: 0 auto;
-    padding: 24px;
-}
-.chat {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    min-height: 500px;
-}
-.message {
-    max-width: 85%;
-    padding: 14px 16px;
-    border-radius: 14px;
-    white-space: pre-wrap;
-    line-height: 1.45;
-}
-.user {
-    align-self: flex-end;
-    background: #dcecff;
-}
-.assistant {
-    align-self: flex-start;
-    background: #ffffff;
-    border: 1px solid #e1e1e1;
-}
-.meta {
-    margin-top: 10px;
-    color: #777;
-    font-size: 12px;
-}
-.details {
-    margin-top: 12px;
-}
-details {
-    margin-top: 10px;
-}
-summary {
-    cursor: pointer;
-    color: #555;
-}
-pre {
-    background: #f1f3f4;
-    padding: 12px;
-    border-radius: 8px;
-    overflow-x: auto;
-    font-size: 12px;
-}
-table {
-    border-collapse: collapse;
-    width: 100%;
-    margin-top: 10px;
-    background: white;
-}
-th, td {
-    border: 1px solid #ddd;
-    padding: 8px;
-    text-align: left;
-}
-.composer {
-    position: sticky;
-    bottom: 0;
-    background: #f4f6f8;
-    padding: 14px 0 0;
-}
-.row {
-    display: flex;
-    gap: 10px;
-}
-textarea {
-    flex: 1;
-    resize: vertical;
-    min-height: 60px;
-    max-height: 180px;
-    padding: 12px;
-    border: 1px solid #ccc;
-    border-radius: 10px;
-    font: inherit;
-}
-button {
-    border: 0;
-    border-radius: 10px;
-    padding: 0 22px;
-    font-size: 15px;
-    cursor: pointer;
-    background: #222;
-    color: white;
-}
-button:disabled {
-    opacity: .5;
-    cursor: wait;
-}
-.example {
-    margin-top: 8px;
-    color: #777;
-    font-size: 13px;
-}
-.error {
-    color: #a40000;
-}
-.loading {
-    color: #777;
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+.role-screen{position:fixed;inset:0;z-index:50;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 20%,rgba(124,77,255,.22),transparent 34%),rgba(8,6,15,.94);backdrop-filter:blur(18px)}.role-card{width:min(760px,100%);padding:38px;border:1px solid rgba(209,196,233,.16);border-radius:30px;background:linear-gradient(145deg,rgba(37,21,60,.97),rgba(13,11,26,.97));box-shadow:0 30px 100px rgba(0,0,0,.6);text-align:center}.role-logo{width:76px;height:76px;margin:0 auto 18px;border-radius:24px;display:grid;place-items:center;font-size:34px;background:linear-gradient(145deg,#4a2c7a,#7c4dff 55%,#e040fb);box-shadow:0 15px 45px rgba(124,77,255,.32)}.role-card h1{margin:0;font-size:29px}.role-card p{color:var(--muted);font-size:12px;line-height:1.6;margin:10px auto 24px;max-width:560px}.roles{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.role-btn{border:1px solid var(--border);border-radius:18px;background:rgba(255,255,255,.035);color:#f4eefb;padding:20px 14px;cursor:pointer;text-align:left;transition:.22s}.role-btn:hover{transform:translateY(-3px);border-color:rgba(179,136,255,.42);background:linear-gradient(145deg,rgba(124,77,255,.15),rgba(224,64,251,.08));box-shadow:0 15px 35px rgba(0,0,0,.25)}.role-btn b{display:block;font-size:14px}.role-btn span{display:block;margin-top:7px;color:#9488a4;font-size:10px;line-height:1.45}.role-note{margin-top:18px;color:#6f647b;font-size:9px;line-height:1.5}@media(max-width:650px){.roles{grid-template-columns:1fr}.role-card{padding:28px 18px}}:root{--bg:#0d0b1a;--bg2:#1a0f2e;--panel:rgba(28,16,48,.78);--panel2:rgba(255,255,255,.045);--violet:#7c4dff;--neon:#e040fb;--lav:#d1c4e9;--text:#faf7ff;--muted:#9f93b1;--border:rgba(209,196,233,.13);--shadow:0 30px 90px rgba(0,0,0,.55)}
+*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{min-height:100vh;overflow:hidden;font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 8% 8%,rgba(124,77,255,.28),transparent 27%),radial-gradient(circle at 92% 12%,rgba(224,64,251,.19),transparent 24%),linear-gradient(135deg,#0d0b1a,#1a0f2e 55%,#0d0b1a)}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.2;background-image:linear-gradient(rgba(209,196,233,.045) 1px,transparent 1px),linear-gradient(90deg,rgba(209,196,233,.045) 1px,transparent 1px);background-size:44px 44px;mask-image:radial-gradient(ellipse at center,black 0%,transparent 76%)}
+.orb{position:fixed;border-radius:50%;pointer-events:none;filter:blur(10px);z-index:0;animation:float 10s ease-in-out infinite}.orb.one{width:320px;height:320px;left:-120px;top:-100px;background:rgba(124,77,255,.2);box-shadow:0 0 130px rgba(124,77,255,.2)}.orb.two{width:230px;height:230px;right:-70px;top:25%;background:rgba(224,64,251,.14);animation-delay:-3s}.orb.three{width:360px;height:360px;left:45%;bottom:-260px;background:rgba(74,44,122,.2);animation-delay:-6s}@keyframes float{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(16px,-20px,0)}}
+.app-shell{position:relative;z-index:2;width:min(1280px,calc(100vw - 48px));height:min(840px,calc(100vh - 48px));margin:24px auto;display:grid;grid-template-columns:270px minmax(0,1fr);gap:18px}
+.sidebar{display:flex;flex-direction:column;padding:24px;border:1px solid var(--border);border-radius:28px;background:linear-gradient(160deg,rgba(37,21,60,.84),rgba(13,11,26,.78));backdrop-filter:blur(24px);box-shadow:var(--shadow);overflow:hidden}.brand{display:flex;align-items:center;gap:12px;margin-bottom:34px}.brand-logo{width:50px;height:50px;border-radius:16px;display:grid;place-items:center;font-size:25px;background:linear-gradient(145deg,#4a2c7a,#7c4dff 55%,#e040fb);box-shadow:0 10px 30px rgba(124,77,255,.32)}.brand strong{display:block;font-size:16px}.brand span{display:block;margin-top:4px;font-size:9px;color:var(--muted);letter-spacing:.4px}.side-title{text-transform:uppercase;letter-spacing:1.6px;font-size:9px;color:#887b9b;margin-bottom:12px}.side-card{padding:14px;margin-bottom:9px;border:1px solid rgba(209,196,233,.09);border-radius:16px;background:rgba(255,255,255,.035);transition:.22s}.side-card:hover{transform:translateY(-2px);background:rgba(124,77,255,.08);border-color:rgba(179,136,255,.24)}.side-card b{display:block;font-size:11px;margin-bottom:5px}.side-card span{display:block;color:#8e829f;font-size:9px;line-height:1.45}.side-footer{margin-top:auto;padding-top:18px;border-top:1px solid rgba(209,196,233,.08);font-size:9px;line-height:1.6;color:#746981}.side-footer b{color:#bdaed0;font-weight:500}
+.widget{min-width:0;min-height:0;height:100%;display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(209,196,233,.16);border-radius:28px;background:linear-gradient(145deg,rgba(29,16,48,.9),rgba(13,11,26,.9));backdrop-filter:blur(26px);box-shadow:var(--shadow),0 0 80px rgba(124,77,255,.1)}
+.header{padding:19px 24px;border-bottom:1px solid var(--border);background:rgba(20,12,36,.56);display:flex;align-items:center;justify-content:space-between;gap:16px}.identity{display:flex;align-items:center;gap:12px;min-width:0}.logo{width:44px;height:44px;flex:0 0 44px;border-radius:14px;display:grid;place-items:center;font-size:22px;background:linear-gradient(145deg,#4a2c7a,#7c4dff 55%,#e040fb);box-shadow:0 8px 26px rgba(124,77,255,.35);border:1px solid rgba(255,255,255,.12)}.name{font-size:17px;font-weight:800;letter-spacing:-.3px}.subtitle{margin-top:4px;font-size:10px;color:var(--muted)}.header-actions{display:flex;align-items:center;gap:9px}.status{display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:999px;font-size:9px;color:#c4b9cf;background:rgba(255,255,255,.035);border:1px solid var(--border)}.status-dot{width:7px;height:7px;border-radius:50%;background:#69e7a4;box-shadow:0 0 10px #69e7a4}.icon-btn{width:34px;height:34px;border-radius:11px;border:1px solid var(--border);background:rgba(255,255,255,.035);color:#d2c6dd;cursor:pointer;transition:.2s}.icon-btn:hover{transform:translateY(-2px);background:rgba(124,77,255,.16);border-color:rgba(179,136,255,.3)}
+.chat{flex:1;min-height:0;overflow-y:auto;padding:30px 44px 24px;scroll-behavior:smooth}.chat::-webkit-scrollbar{width:6px}.chat::-webkit-scrollbar-thumb{background:rgba(209,196,233,.16);border-radius:20px}.welcome{text-align:center;padding:45px 20px 30px;animation:rise .45s ease}.welcome-logo{width:72px;height:72px;margin:0 auto 16px;border-radius:23px;display:grid;place-items:center;background:linear-gradient(145deg,rgba(124,77,255,.22),rgba(224,64,251,.1));border:1px solid rgba(209,196,233,.14);box-shadow:inset 0 1px rgba(255,255,255,.08),0 18px 50px rgba(124,77,255,.14)}.welcome-logo span{font-size:32px;background:linear-gradient(135deg,#fff,#b388ff,#e040fb);-webkit-background-clip:text;background-clip:text;color:transparent}.welcome h1{font-size:29px;letter-spacing:-.8px;margin:0}.welcome p{font-size:13px;line-height:1.6;color:var(--muted);max-width:600px;margin:9px auto 23px}.chips{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;max-width:860px;margin:auto}.chip{border:1px solid var(--border);border-radius:16px;background:rgba(255,255,255,.035);color:#e1d9e9;padding:14px 12px;cursor:pointer;text-align:left;transition:.22s;font:600 11px/1.4 Inter,system-ui}.chip:hover{transform:translateY(-3px);border-color:rgba(179,136,255,.32);background:linear-gradient(145deg,rgba(124,77,255,.14),rgba(224,64,251,.07));box-shadow:0 12px 30px rgba(0,0,0,.2)}.chip span{display:block;color:#8f83a0;font-size:9px;margin-top:5px;font-weight:400}.row{display:flex;margin:10px 0;animation:rise .25s ease}.row.user{justify-content:flex-end}.bubble{max-width:min(78%,760px);padding:14px 17px;font-size:13px;line-height:1.6;word-break:break-word}.bubble.user{color:#fff;background:linear-gradient(135deg,#5b32b2,#7c4dff 58%,#9b55e8);border:1px solid rgba(255,255,255,.13);border-radius:18px 18px 5px 18px;box-shadow:0 10px 28px rgba(74,44,122,.3)}.bubble.bot{background:linear-gradient(145deg,rgba(52,31,78,.68),rgba(28,17,45,.76));border:1px solid var(--border);border-radius:18px 18px 18px 5px;color:#f1ebf8;box-shadow:0 10px 28px rgba(0,0,0,.18);backdrop-filter:blur(15px)}.bubble.error{border-color:rgba(255,100,145,.25);background:rgba(87,25,50,.3);color:#ffdce6}.meta{margin-top:9px;font-size:10px;color:#756b82}.loading-dots{display:inline-flex;gap:4px;margin-left:5px;vertical-align:middle}.loading-dots i{width:5px;height:5px;border-radius:50%;background:#b388ff;animation:pulse 1.1s infinite}.loading-dots i:nth-child(2){animation-delay:.15s}.loading-dots i:nth-child(3){animation-delay:.3s}@keyframes pulse{0%,80%,100%{opacity:.2;transform:scale(.75)}40%{opacity:1;transform:scale(1)}}@keyframes rise{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+.details{margin-top:11px;border-top:1px solid rgba(209,196,233,.08);padding-top:9px}.details summary{cursor:pointer;color:#bda7df;font-size:10px;list-style:none}.details summary::-webkit-details-marker{display:none}.details summary:before{content:"＋ ";color:#e040fb}.details[open] summary:before{content:"－ "}pre{margin:8px 0 0;background:#090611;border:1px solid rgba(209,196,233,.08);border-radius:10px;padding:12px;overflow:auto;color:#d7c8e7;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.table-wrap{overflow:auto;margin-top:8px;border:1px solid var(--border);border-radius:10px}table{width:100%;border-collapse:collapse;min-width:320px}th,td{padding:9px 10px;border-bottom:1px solid rgba(209,196,233,.06);font-size:10px;text-align:left;white-space:nowrap}th{background:rgba(124,77,255,.08);color:#cbb8e2}td{color:#d9d0e2}
+.composer{padding:15px 24px 18px;border-top:1px solid var(--border);background:rgba(13,11,26,.76);backdrop-filter:blur(18px)}.input-box{display:flex;align-items:flex-end;gap:9px;padding:7px;border-radius:18px;border:1px solid rgba(209,196,233,.14);background:rgba(255,255,255,.045);transition:.2s}.input-box:focus-within{border-color:rgba(179,136,255,.42);box-shadow:0 0 0 3px rgba(124,77,255,.08),0 0 28px rgba(124,77,255,.08)}textarea{width:100%;min-height:48px;max-height:130px;resize:none;border:0;outline:0;background:transparent;color:var(--text);font:13px/1.5 Inter,system-ui;padding:9px 10px}textarea::placeholder{color:#746a80}.send{width:46px;height:46px;flex:0 0 46px;border:0;border-radius:14px;color:#fff;cursor:pointer;font-size:16px;background:linear-gradient(135deg,#6d3de0,#7c4dff 48%,#e040fb);box-shadow:0 9px 24px rgba(124,77,255,.34);transition:.2s}.send:hover{transform:translateY(-2px) scale(1.02);box-shadow:0 12px 30px rgba(224,64,251,.25)}.send:active{transform:scale(.95)}.send:disabled{opacity:.45;cursor:wait}.composer-bottom{display:flex;justify-content:space-between;padding:8px 3px 0;color:#675d72;font-size:9px}.safe{color:#9182a2}.safe b{color:#b9a4cf;font-weight:500}
+@media(max-width:950px){.app-shell{width:calc(100vw - 28px);height:calc(100vh - 28px);grid-template-columns:1fr}.sidebar{display:none}.chat{padding:24px}.chips{grid-template-columns:1fr 1fr}}
+@media(max-width:600px){body{overflow:hidden}.app-shell{width:100vw;height:100vh;margin:0}.widget{border-radius:0;border:0}.header{padding:16px}.chat{padding:18px 14px}.composer{padding:10px 12px 12px}.welcome{padding:28px 8px 20px}.welcome h1{font-size:22px}.welcome p{font-size:11px}.chips{grid-template-columns:1fr 1fr}.bubble{max-width:88%;font-size:11px}}
 </style>
 </head>
 <body>
-<div class="header">
-    <h1>University AI Assistant</h1>
-    <p>YandexGPT → Text-to-SQL → PostgreSQL → ответ на русском</p>
-</div>
-
-<div class="container">
-    <div id="chat" class="chat">
-        <div class="message assistant">
-            Здравствуйте! Я могу отвечать на вопросы по базе университета.
-            Например: «сколько студентов обучается на лингвистическом факультете?»
-        </div>
+<div id="roleScreen" class="role-screen">
+  <div class="role-card">
+    <div class="role-logo">🧠</div>
+    <h1>Кто вы?</h1>
+    <p>Выберите роль, под которой хотите работать с университетским AI-помощником.</p>
+    <div class="roles">
+      <button class="role-btn" data-role="applicant"><b>🎓 Абитуриент</b><span>Факультеты, направления, поступление и открытая статистика.</span></button>
+      <button class="role-btn" data-role="student"><b>📚 Студент</b><span>Учебная информация и доступная агрегированная статистика.</span></button>
+      <button class="role-btn" data-role="teacher"><b>👨‍🏫 Преподаватель</b><span>Полный доступ к данным, разрешенным приложением.</span></button>
     </div>
-
-    <div class="composer">
-        <div class="row">
-            <textarea id="question"
-                placeholder="Введите вопрос о студентах, факультетах, преподавателях..."
-                maxlength="1000"></textarea>
-            <button id="send">Отправить</button>
-        </div>
-        <div class="example">
-            Примеры: «сколько всего студентов», «сколько студентов обучается
-            на лингвистическом факультете», «кто декан факультета Лингвистика»
-        </div>
-    </div>
+    <div class="role-note">Без пароля это выбор режима доступа, а не подтверждение личности. Для production роль нужно связывать с аккаунтом.</div>
+  </div>
 </div>
-
+<div class="orb one"></div><div class="orb two"></div><div class="orb three"></div>
+<div class="app-shell">
+<aside class="sidebar">
+  <div class="brand"><div class="brand-logo">🧠</div><div><strong>Код Байкала AI</strong><span>UNIVERSITY INTELLIGENCE</span></div></div>
+  <div class="side-title">Возможности</div>
+  <div class="side-card"><b>◉ Студенты</b><span>Количество обучающихся и общая статистика</span></div>
+  <div class="side-card"><b>◇ Факультеты</b><span>Факультеты, направления и деканы</span></div>
+  <div class="side-card"><b>✧ Преподаватели</b><span>Информация о преподавателях университета</span></div>
+  <div class="side-card"><b>⌁ Безопасный доступ</b><span>Запросы выполняются только в режиме чтения</span></div>
+  <div class="side-footer"><b>AI-помощник университета</b><br>Задавайте вопросы обычным языком — система найдёт данные в PostgreSQL и сформирует понятный ответ.</div>
+</aside>
+<section class="widget" aria-label="Чат-бот Код Байкала AI">
+<header class="header"><div class="identity"><div class="logo">🧠</div><div><div class="name">Код Байкала AI</div><div class="subtitle">Интеллектуальный помощник университета</div></div></div><div class="header-actions"><div class="status" id="roleBadge">роль не выбрана</div><div class="status"><span class="status-dot"></span>онлайн</div><button class="icon-btn" id="switchRole" title="Сменить роль">⇄</button><button class="icon-btn" id="clear" title="Новый чат" aria-label="Новый чат">↻</button></div></header>
+<main id="chat" class="chat"><div id="welcome" class="welcome"><div class="welcome-logo"><span>✦</span></div><h1>Чем могу помочь?</h1><p>Задайте вопрос обычным языком — я найду информацию в базе университета и отвечу понятно и по-русски.</p><div class="chips"><button class="chip" data-q="Сколько всего студентов?">◉ Студенты<span>Общая статистика</span></button><button class="chip" data-q="Сколько студентов обучается на лингвистическом факультете?">⌁ Факультеты<span>Количество студентов</span></button><button class="chip" data-q="Кто декан факультета лингвистики?">◇ Деканы<span>Руководители факультетов</span></button><button class="chip" data-q="Назови ФИО 10 преподавателей">✧ Преподаватели<span>Список преподавателей</span></button></div></div></main>
+<footer class="composer"><div class="input-box"><textarea id="question" maxlength="1000" placeholder="Напишите вопрос о студентах, факультетах, преподавателях…"></textarea><button id="send" class="send" title="Отправить" aria-label="Отправить">➤</button></div><div class="composer-bottom"><span>Enter — отправить · Shift + Enter — перенос</span><span class="safe">✦ <b>Данные защищены</b> · <span id="counter">0/1000</span></span></div></footer>
+</section></div>
 <script>
-const chat = document.getElementById("chat");
-const question = document.getElementById("question");
-const send = document.getElementById("send");
+const chat=document.getElementById("chat"),question=document.getElementById("question"),send=document.getElementById("send"),counter=document.getElementById("counter"),clearBtn=document.getElementById("clear");
+const roleScreen=document.getElementById("roleScreen");
+const roleBadge=document.getElementById("roleBadge");
+const switchRoleBtn=document.getElementById("switchRole");
+const roleNames={applicant:"Абитуриент",student:"Студент",teacher:"Преподаватель"};
+let currentRole=null;
 
-function addMessage(text, cls) {
-    const div = document.createElement("div");
-    div.className = "message " + cls;
-    div.textContent = text;
-    chat.appendChild(div);
-    div.scrollIntoView({behavior: "smooth", block: "end"});
-    return div;
+async function selectRole(role){
+  try{
+    const response=await fetch("/api/role",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({role})});
+    const result=await response.json();
+    if(!result.ok){alert(result.error||"Не удалось выбрать роль.");return;}
+    currentRole=role;
+    roleBadge.textContent="Роль · "+roleNames[role];
+    roleScreen.style.display="none";
+    question.focus();
+  }catch(e){alert("Не удалось установить роль. Попробуйте ещё раз.");}
 }
-
-function addResult(result) {
-    const div = document.createElement("div");
-    div.className = "message assistant";
-
-    const answer = document.createElement("div");
-    answer.textContent = result.answer || "";
-    div.appendChild(answer);
-
-    if (result.sql) {
-        const details = document.createElement("details");
-        const summary = document.createElement("summary");
-        summary.textContent = "Показать SQL-запрос";
-        details.appendChild(summary);
-
-        const pre = document.createElement("pre");
-        pre.textContent = result.sql;
-        details.appendChild(pre);
-        div.appendChild(details);
-    }
-
-    if (Array.isArray(result.rows) && result.rows.length) {
-        const details = document.createElement("details");
-        const summary = document.createElement("summary");
-        summary.textContent = "Показать результат БД";
-        details.appendChild(summary);
-
-        const table = document.createElement("table");
-        const keys = Object.keys(result.rows[0]);
-
-        const trHead = document.createElement("tr");
-        keys.forEach(k => {
-            const th = document.createElement("th");
-            th.textContent = k;
-            trHead.appendChild(th);
-        });
-        table.appendChild(trHead);
-
-        result.rows.forEach(row => {
-            const tr = document.createElement("tr");
-            keys.forEach(k => {
-                const td = document.createElement("td");
-                td.textContent = row[k] ?? "";
-                tr.appendChild(td);
-            });
-            table.appendChild(tr);
-        });
-
-        details.appendChild(table);
-        div.appendChild(details);
-    }
-
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent =
-        "Время обработки: " + (result.response_time_ms ?? "-") + " мс";
-    div.appendChild(meta);
-
-    chat.appendChild(div);
-    div.scrollIntoView({behavior: "smooth", block: "end"});
+async function loadRole(){
+  try{
+    const response=await fetch("/api/role");
+    const result=await response.json();
+    if(result.ok&&result.role){
+      currentRole=result.role;
+      roleBadge.textContent="Роль · "+roleNames[result.role];
+      roleScreen.style.display="none";
+    }else roleScreen.style.display="grid";
+  }catch(e){roleScreen.style.display="grid";}
 }
+switchRoleBtn.addEventListener("click",()=>{currentRole=null;roleScreen.style.display="grid";});
+document.querySelectorAll(".role-btn").forEach(btn=>btn.addEventListener("click",()=>selectRole(btn.dataset.role)));
 
-async function sendQuestion() {
-    const text = question.value.trim();
-    if (!text) return;
-
-    addMessage(text, "user");
-    question.value = "";
-    send.disabled = true;
-
-    const loading = addMessage("Обрабатываю запрос…", "assistant loading");
-
-    try {
-        const response = await fetch("/api/ask", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({question: text})
-        });
-
-        const result = await response.json();
-        loading.remove();
-
-        if (!result.ok) {
-            addMessage(result.error || "Неизвестная ошибка.", "assistant error");
-        } else {
-            addResult(result);
-        }
-    } catch (error) {
-        loading.remove();
-        addMessage(
-            "Не удалось связаться с сервером: " + error.message,
-            "assistant error"
-        );
-    } finally {
-        send.disabled = false;
-        question.focus();
-    }
-}
-
-send.addEventListener("click", sendQuestion);
-
-question.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
-        event.preventDefault();
-        sendQuestion();
-    }
-});
+const welcomeHTML=document.getElementById("welcome")?.outerHTML||"";
+function scrollBottom(){requestAnimationFrame(()=>{chat.scrollTop=chat.scrollHeight})}
+function addMessage(text,type){const row=document.createElement("div");row.className="row "+type;const bubble=document.createElement("div");bubble.className="bubble "+(type==="error"?"error":type);bubble.textContent=text;row.appendChild(bubble);chat.appendChild(row);scrollBottom();return row}
+function addLoading(){const row=document.createElement("div");row.className="row assistant";row.innerHTML='<div class="bubble bot">Ищу ответ<span class="loading-dots"><i></i><i></i><i></i></span></div>';chat.appendChild(row);scrollBottom();return row}
+function addResult(result){const row=document.createElement("div");row.className="row assistant";const bubble=document.createElement("div");bubble.className="bubble bot";const answer=document.createElement("div");answer.textContent=result.answer||"";bubble.appendChild(answer);if(result.sql){const d=document.createElement("details");d.className="details";const s=document.createElement("summary");s.textContent="Показать SQL-запрос";d.appendChild(s);const pre=document.createElement("pre");pre.textContent=result.sql;d.appendChild(pre);bubble.appendChild(d)}if(Array.isArray(result.rows)&&result.rows.length){const d=document.createElement("details");d.className="details";const s=document.createElement("summary");s.textContent="Показать результат БД";d.appendChild(s);const wrap=document.createElement("div");wrap.className="table-wrap";const table=document.createElement("table");const keys=Object.keys(result.rows[0]);const head=document.createElement("tr");keys.forEach(k=>{const th=document.createElement("th");th.textContent=k;head.appendChild(th)});table.appendChild(head);result.rows.forEach(r=>{const tr=document.createElement("tr");keys.forEach(k=>{const td=document.createElement("td");td.textContent=r[k]??"";tr.appendChild(td)});table.appendChild(tr)});wrap.appendChild(table);d.appendChild(wrap);bubble.appendChild(d)}if(result.response_time_ms!==undefined){const meta=document.createElement("div");meta.className="meta";meta.textContent="Время обработки · "+result.response_time_ms+" мс";bubble.appendChild(meta)}row.appendChild(bubble);chat.appendChild(row);scrollBottom()}
+async function sendQuestion(chipText=null){const text=(chipText??question.value).trim();if(!text)return;document.getElementById("welcome")?.remove();addMessage(text,"user");question.value="";counter.textContent="0/1000";send.disabled=true;const loading=addLoading();try{const response=await fetch("/api/ask",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:text})});const result=await response.json();loading.remove();if(!result.ok)addMessage(result.error||"Вопрос некорректен. Пожалуйста, сформулируйте вопрос по данным университета.","error");else addResult(result)}catch(error){loading.remove();addMessage("Не удалось связаться с сервером. Попробуйте ещё раз.","error")}finally{send.disabled=false;question.focus()}}
+function clearChat(){chat.innerHTML=welcomeHTML;document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>sendQuestion(c.dataset.q)));loadRole();question.value="";counter.textContent="0/1000";question.focus()}
+send.addEventListener("click",()=>sendQuestion());clearBtn.addEventListener("click",clearChat);question.addEventListener("input",()=>counter.textContent=question.value.length+"/1000");question.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendQuestion()}});document.querySelectorAll(".chip").forEach(c=>c.addEventListener("click",()=>sendQuestion(c.dataset.q)));
 </script>
 </body>
 </html>
+
+
+
+
 """
 
 
@@ -1407,12 +1575,68 @@ async def http_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             )
             return
 
+
+        if method == "GET" and path == "/api/role":
+            role = get_role_from_headers(headers)
+            response = json.dumps(
+                {"ok": bool(role), "role": role},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            await http_response(
+                writer, 200, "application/json; charset=utf-8", response
+            )
+            return
+
+        if method == "POST" and path == "/api/role":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                role = str(payload.get("role", "")).strip().lower()
+                if role not in ROLE_LABELS:
+                    response = json.dumps(
+                        {"ok": False, "error": "Неизвестная роль."},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    await http_response(
+                        writer, 400, "application/json; charset=utf-8", response
+                    )
+                    return
+
+                cookie = sign_role(role)
+                response = json.dumps(
+                    {"ok": True, "role": role, "label": ROLE_LABELS[role]},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                headers_out = (
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json; charset=utf-8\r\n"
+                    + f"Content-Length: {len(response)}\r\n".encode("ascii")
+                    + f"Set-Cookie: {ROLE_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Lax\r\n".encode("ascii")
+                    + b"Connection: close\r\n\r\n"
+                )
+                writer.write(headers_out + response)
+                await writer.drain()
+                writer.close()
+                return
+            except Exception as exc:
+                response = json.dumps(
+                    {"ok": False, "error": str(exc)},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                await http_response(
+                    writer, 400, "application/json; charset=utf-8", response
+                )
+                return
+
         if method == "POST" and path == "/api/ask":
             try:
                 payload = json.loads(body.decode("utf-8"))
                 question = str(payload.get("question", ""))
 
-                result = await process_question(question)
+                role = get_role_from_headers(headers)
+                if not role:
+                    result = {"ok": False, "error": "Сначала выберите роль пользователя."}
+                else:
+                    result = await process_question(question, role)
 
                 response = json.dumps(
                     result,
@@ -1499,7 +1723,7 @@ async def console_mode():
             }:
                 break
 
-            result = await process_question(question)
+            result = await process_question(question, "teacher")
 
             if not result["ok"]:
                 print("\nОШИБКА:")
