@@ -4,7 +4,6 @@ import requests
 import json
 import logging
 import os
-from dotenv import load_dotenv
 import re
 import sys
 import time
@@ -13,8 +12,6 @@ import hashlib
 import hmac
 from getpass import getpass
 from typing import Optional
-
-load_dotenv()
 
 # ============================================================
 # CONFIG
@@ -27,11 +24,11 @@ YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
 YANDEX_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 YANDEX_MODEL = f"gpt://{YANDEX_FOLDER_ID}/yandexgpt/latest"
 
-DB_HOST = os.getenv("DB_HOST", "").strip()
+DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_NAME = os.getenv("DB_NAME", "").strip()
-DB_USER = os.getenv("DB_USER", "").strip()
-DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
+DB_NAME = os.getenv("DB_NAME", "university")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 HOST = "127.0.0.1"
 PORT = 8000
@@ -47,9 +44,10 @@ MAX_SQL_REPAIR_ATTEMPTS = 2
 # ============================================================
 
 ROLE_COOKIE = "university_role"
-ROLE_SECRET = os.getenv("ROLE_SECRET", "").encode("utf-8")
-if not ROLE_SECRET:
-    raise RuntimeError("ROLE_SECRET не задан в .env")
+ROLE_SECRET = os.getenv("ROLE_SECRET", "change-me-in-production").encode("utf-8")
+
+if not YANDEX_FOLDER_ID:
+    print("Внимание: YANDEX_FOLDER_ID не задан. Укажите его в .env или переменных окружения.")
 
 ROLE_LABELS = {
     "applicant": "Абитуриент",
@@ -68,8 +66,15 @@ ROLE_ALLOWED_RELATIONS = {
         "v_simple_faculty_stats",
     },
     "student": {
+        # Студент получает весь открытый слой абитуриента.
         "faculties", "departments", "study_programs",
-        "courses", "groups", "schedule", "academic_statistics",
+        "admission_statistics",
+        # Учебная информация.
+        "courses", "groups", "course_assignments", "schedule",
+        "grades", "academic_statistics",
+        # Преподаватели: ФИО и профессиональная информация доступны студенту.
+        "teachers",
+        # Статистические/обезличенные представления.
         "v_students_by_faculty", "v_simple_faculty_stats",
         "v_faculty_search", "v_faculty_statistics",
         "v_students_anonymized", "v_teachers_anonymized",
@@ -114,8 +119,9 @@ def role_description(role: str) -> str:
             "о студентах, оценках, средних баллах, расписании и преподавателях."
         ),
         "student": (
-            "Роль: СТУДЕНТ. Доступна учебная информация и агрегированная "
-            "статистика. Нельзя выдавать персональные данные других студентов."
+            "Роль: СТУДЕНТ. Доступны факультеты, направления и сведения о поступлении, "
+            "учебная информация, расписание, оценки, академическая статистика и "
+            "сведения о преподавателях. Нельзя выдавать персональные данные других студентов."
         ),
         "teacher": (
             "Роль: ПРЕПОДАВАТЕЛЬ. Доступны все relations, разрешенные "
@@ -140,10 +146,13 @@ def validate_role_question(role: str, question: str) -> tuple[bool, str]:
             )
 
     if role == "student":
+        # Не блокируем слова «ФИО/фамилия/имя» вообще: студент имеет право
+        # спрашивать ФИО преподавателей. Ограничение персональных данных
+        # студентов дополнительно обеспечивается validate_sql().
         blocked = (
-            "фио", "фамили", "имя", "отчество", "student_code",
-            "идентификатор студента", "телефон", "email", "почт",
-            "паспорт", "адрес",
+            "student_code", "идентификатор студента", "телефон студента",
+            "email студента", "почта студента", "паспорт студента",
+            "адрес студента",
         )
         if any(x in q for x in blocked):
             return False, (
@@ -711,17 +720,37 @@ def validate_sql(sql: str, role: str = "teacher") -> tuple[bool, str]:
         ):
             return False, "Нельзя выводить все поля students."
 
-        for column in FORBIDDEN_STUDENT_COLUMNS:
-            if re.search(
-                rf"\b{column}\b",
-                sql,
-                flags=re.IGNORECASE,
-            ):
-                # COUNT(student_code) не нужен и тоже не разрешаем.
+        # Персональные поля студентов запрещены для applicant/student.
+        # ФИО преподавателей при этом разрешены.
+        forbidden_student_personal_columns = {
+            "student_code", "last_name", "first_name", "middle_name",
+            "phone", "email", "passport", "address",
+        }
+        student_aliases = re.findall(
+            r"\b(?:FROM|JOIN)\s+students(?:\s+AS)?\s+([a-zA-Z_]\w*)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+        for column in forbidden_student_personal_columns:
+            # Квалифицированные обращения: s.last_name / students.last_name.
+            if re.search(rf"\bstudents\s*\.\s*{column}\b", sql, flags=re.IGNORECASE):
                 return False, (
-                    f"Нельзя использовать персональный идентификатор "
-                    f"студента: {column}"
+                    f"Нельзя выводить персональные данные студента: {column}"
                 )
+            for alias in student_aliases:
+                if re.search(rf"\b{re.escape(alias)}\s*\.\s*{column}\b", sql, flags=re.IGNORECASE):
+                    return False, (
+                        f"Нельзя выводить персональные данные студента: {column}"
+                    )
+
+        # Если students используется без alias и колонка не квалифицирована,
+        # запрещаем персональные поля, чтобы не было обхода через SELECT last_name.
+        if re.search(r"\b(?:FROM|JOIN)\s+students\b(?!\s+(?:AS\s+)?[a-zA-Z_]\w*)", sql, flags=re.IGNORECASE):
+            for column in forbidden_student_personal_columns:
+                if re.search(rf"(?<![.\w]){column}\b", sql, flags=re.IGNORECASE):
+                    return False, (
+                        f"Нельзя выводить персональные данные студента: {column}"
+                    )
 
     return True, "OK"
 
@@ -768,16 +797,20 @@ SQL_SYSTEM_PROMPT = """
     "лингвистика".
 13. Не подменяй "Лингвистика" другим факультетом.
 14. Если вопрос про декана — используй dean_name из faculties.
-15. В teachers НЕТ teacher_name. Там есть teacher_code, position, degree.
-    Не придумывай ФИО преподавателей.
-16. Если вопрос требует список студентов, не показывай ФИО/ID студентов.
-    Используй агрегаты или обезличенные views.
+15. В teachers есть ФИО преподавателя: last_name, first_name, middle_name,
+    а также teacher_code, position, degree и hire_year. Для student и teacher
+    ФИО преподавателей разрешены. Не путай teachers с v_teachers_anonymized.
+16. Если вопрос требует список студентов, для applicant/student не показывай
+    ФИО, student_code и другие идентификаторы студентов. Используй агрегаты
+    или обезличенные views. Для вопросов о преподавателях студент может получать ФИО.
 17. Для одного числового ответа обязательно дай понятный alias:
     student_count, active_students, faculty_count и т.п.
 18. Если пользователь просит количество по факультету, желательно вернуть
     название факультета вместе с количеством.
 19. SQL должен быть максимально простым и читаемым.
-20. Верни ТОЛЬКО SQL, без Markdown и без объяснений.
+20. Если студент спрашивает о преподавателях, используй таблицу teachers и JOIN departments/faculties при необходимости.
+21. Если студент спрашивает о поступлении, используй те же relations, что доступны абитуриенту: faculties, departments, study_programs, admission_statistics и связанные открытые views.
+22. Верни ТОЛЬКО SQL, без Markdown и без объяснений.
 
 ПРИМЕР 1:
 Вопрос: "сколько студентов обучается на лингвистическом факультете?"

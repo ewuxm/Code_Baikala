@@ -1,12 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
 .env
 .env.*
 !.env.example
 
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-env/
+# IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
+
+# Local databases / dumps
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
